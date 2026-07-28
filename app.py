@@ -274,7 +274,30 @@ def attach_rulings(question: str, message_id: int | None) -> list[int]:
 # =============================================================
 # システムプロンプト構築（5タイプ判別ロジック統合）
 # =============================================================
-def build_system_prompt(selected_grant, selected_form, form_map, rules_and_cases, relevant_chunks):
+def build_domain_notes(cfg: dict) -> str:
+    """domain_config.json の important_notes をプロンプト上位に差し込む文面にする。
+
+    廃止されたコースなど「資料に書かれていない前提」を伝えるための枠。
+    支給要領そのものには『このコースは廃止された』と書かれていないため、
+    ルールに混ぜるだけでは大量の他ルールに埋もれて読まれない。
+    """
+    notes = cfg.get("important_notes") or []
+    if not notes:
+        return ""
+    body = "\n".join(f"  ・{n}" for n in notes)
+    return f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【この制度に関する最重要の前提】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+以下は公式資料の記載より優先して適用すること。
+矛盾する記述が資料内にあっても、必ず以下を正としてユーザーに案内すること。
+
+{body}
+"""
+
+
+def build_system_prompt(selected_grant, selected_form, form_map, rules_and_cases, relevant_chunks,
+                        domain_notes=""):
     form_data = form_map.get(selected_form, {})
     today = date.today()
     reiwa_year = today.year - 2018
@@ -287,7 +310,7 @@ def build_system_prompt(selected_grant, selected_form, form_map, rules_and_cases
 【本日の日付】{today_str}
 ※ 現在の年月日は必ず上記を基準にしてください。あなたの学習データ上の年ではなく、上記の日付が「今日」です。
 ※ 「今年」「来年」「今年度」等の相対表現や、日付の過去・未来の判定は、すべて上記の本日の日付を基準に解釈すること。
-
+{domain_notes}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 【最重要：対話の鉄則】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -329,7 +352,7 @@ def build_system_prompt(selected_grant, selected_form, form_map, rules_and_cases
 # =============================================================
 # 添削用システムプロンプト構築
 # =============================================================
-def build_review_prompt(selected_form, form_map, rules_and_cases):
+def build_review_prompt(selected_form, form_map, rules_and_cases, domain_notes=""):
     form_items = form_map.get(selected_form, {}).get("items", [])
     today = date.today()
     reiwa_year = today.year - 2018
@@ -340,6 +363,7 @@ def build_review_prompt(selected_form, form_map, rules_and_cases):
 
 【本日の日付】{today_str}
 ※ 日付の過去・未来の判定は必ず上記の本日の日付を基準にしてください。
+{domain_notes}
 
 【添削手順】
 STEP1: 書類の各項目を識別し、【様式基準】のitem_idと照合する。
@@ -364,7 +388,8 @@ def review_document(uploaded_file, selected_form, form_map, rules_and_cases):
     file_name      = uploaded_file.name.lower()
     stage          = get_stage_for_form(selected_form, domain_config)
     filtered_rules = filter_rules_by_stage(rules_and_cases, stage)
-    review_sys     = build_review_prompt(selected_form, form_map, filtered_rules)
+    review_sys     = build_review_prompt(selected_form, form_map, filtered_rules,
+                                     domain_notes=build_domain_notes(domain_config))
 
     if file_name.endswith(".pdf"):
         pdf_bytes = uploaded_file.read()
@@ -498,6 +523,7 @@ def send_and_stream(prompt: str) -> bool:
                 st.session_state.selected_grant,
                 st.session_state.selected_form,
                 form_map, filtered_rules, relevant_chunks,
+                domain_notes=build_domain_notes(domain_config),
             )
             gemini_contents = build_gemini_contents(st.session_state.messages, prompt)
 
