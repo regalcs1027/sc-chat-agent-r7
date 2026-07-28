@@ -1,5 +1,5 @@
 """
-admin.py  –  管理画面 UI（ユーザー管理・会話履歴閲覧・利用統計）
+admin.py  –  管理画面 UI（ユーザー管理・会話履歴閲覧・利用統計・修正事例）
 """
 import streamlit as st
 from auth import require_admin, hash_password
@@ -7,6 +7,14 @@ from db import (
     get_all_users, create_user, update_password, set_user_active, delete_user,
     get_all_user_stats,
     get_all_conversations_by_user, get_messages_by_conversation,
+    create_ruling, get_rulings_for_admin, get_active_rulings, update_ruling,
+    set_ruling_active, delete_ruling, get_recent_ruling_hits,
+    get_setting, set_setting,
+)
+from rulings import (
+    encode_embedding, embed_text, find_similar_for_admin, get_client,
+    EMBED_THRESHOLD, SETTING_KEY_THRESHOLD,
+    GLOBAL_THRESHOLD, SETTING_KEY_GLOBAL_THRESHOLD,
 )
 
 
@@ -18,7 +26,8 @@ def _year_label(app_year: str) -> str:
 NAV_USERS = "👥 ユーザー管理"
 NAV_CONVERSATIONS = "💬 会話履歴閲覧"
 NAV_STATS = "📊 利用統計"
-NAV_OPTIONS = [NAV_USERS, NAV_CONVERSATIONS, NAV_STATS]
+NAV_RULINGS = "⚖️ 修正事例"
+NAV_OPTIONS = [NAV_USERS, NAV_CONVERSATIONS, NAV_STATS, NAV_RULINGS]
 
 
 def render_admin_page():
@@ -54,6 +63,8 @@ def render_admin_page():
         _render_user_management()
     elif nav == NAV_CONVERSATIONS:
         _render_conversation_viewer()
+    elif nav == NAV_RULINGS:
+        _render_rulings_manager()
     else:
         _render_usage_stats()
 
@@ -237,10 +248,125 @@ def _render_conversation_viewer():
     messages = get_messages_by_conversation(selected_conv["id"])
     if not messages:
         st.info("メッセージがありません。")
+
+    if st.session_state.pop("ruling_flash", None):
+        st.success("修正事例を登録しました。")
+
+    # AI回答の直前にあるユーザー発言を、その回答への「質問」とみなす
+    prev_question = ""
     for msg in messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             st.caption(msg["created_at"])
+
+            if msg["role"] == "assistant":
+                target = st.session_state.get("ruling_target") or {}
+                if target.get("message_id") == msg["id"]:
+                    _render_ruling_form(target)
+                elif st.button("✏️ この回答を修正", key=f"fix_{msg['id']}"):
+                    st.session_state["ruling_target"] = {
+                        "message_id": msg["id"],
+                        "conversation_id": selected_conv["id"],
+                        "app_year": selected_conv.get("app_year") or "R7",
+                        "domain_key": selected_conv["domain_key"],
+                        "form_name": selected_conv["form_name"],
+                        "question": prev_question,
+                        "original_answer": msg["content"],
+                    }
+                    st.session_state.pop("ruling_similar", None)
+                    st.rerun()
+
+        if msg["role"] == "user":
+            prev_question = msg["content"]
+
+
+def _clear_ruling_target() -> None:
+    st.session_state.pop("ruling_target", None)
+    st.session_state.pop("ruling_similar", None)
+
+
+def _render_ruling_form(target: dict) -> None:
+    """AI回答を修正事例として登録するフォーム（会話履歴の該当メッセージ直下に出す）"""
+    st.divider()
+    st.markdown("**✏️ 修正事例として登録**")
+
+    # 重複登録の防止。表示側で調整するより、登録時に潰すほうが確実。
+    if "ruling_similar" not in st.session_state:
+        try:
+            similar = find_similar_for_admin(
+                get_client(), target["question"], get_active_rulings(target["app_year"])
+            )
+        except Exception:
+            similar = []
+        st.session_state["ruling_similar"] = [
+            {"id": r["id"], "q": r["question_text"], "a": r["corrected_answer"]}
+            for r in similar
+        ]
+
+    for s in st.session_state["ruling_similar"]:
+        st.warning(f"似た事例が登録済みです（#{s['id']}）：{s['q'][:60]}")
+        if st.checkbox("内容を確認する", key=f"peek_{target['message_id']}_{s['id']}"):
+            st.markdown(f"質問：{s['q']}")
+            st.markdown(f"回答：{s['a']}")
+    if st.session_state["ruling_similar"]:
+        st.caption("重複する場合は登録せず、「⚖️ 修正事例」画面で既存を編集してください。")
+
+    with st.form(f"ruling_form_{target['message_id']}"):
+        st.caption(
+            "質問文は検索キーになります。特定の会社の事情に依存した表現は、"
+            "他のケースでも使える言い回しに直してください。"
+        )
+        q = st.text_area("質問文", value=target["question"], height=80)
+        a = st.text_area("正しい回答（現場にはこの内容が表示されます）", height=180)
+        scope = st.radio(
+            "適用範囲",
+            ["この制度・様式のみ", "この制度全体", "全体共通"],
+            horizontal=True,
+        )
+        st.caption(
+            f"⚠️「全体共通」を選ぶと、{target['domain_key']} 以外のすべての制度の質問にも"
+            "表示される可能性があります。判定は厳しくなりますが、"
+            "特定の制度の話であれば「この制度全体」を選んでください。"
+        )
+        memo = st.text_input("メモ（任意・現場には表示されません）")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            submitted = st.form_submit_button("登録", type="primary", use_container_width=True)
+        with c2:
+            cancelled = st.form_submit_button("キャンセル", use_container_width=True)
+
+    if cancelled:
+        _clear_ruling_target()
+        st.rerun()
+
+    if submitted:
+        if not q.strip() or not a.strip():
+            st.error("質問文と正しい回答は必須です。")
+            return
+        if scope == "この制度・様式のみ":
+            domain_key, form_name = target["domain_key"], target["form_name"]
+        elif scope == "この制度全体":
+            domain_key, form_name = target["domain_key"], ""
+        else:
+            domain_key, form_name = "", ""
+
+        create_ruling(
+            app_year=target["app_year"],
+            question_text=q.strip(),
+            corrected_answer=a.strip(),
+            domain_key=domain_key,
+            form_name=form_name,
+            original_answer=target["original_answer"],
+            comment=memo.strip(),
+            source_conversation_id=target["conversation_id"],
+            source_message_id=target["message_id"],
+            embedding=encode_embedding(embed_text(get_client(), q.strip())),
+            created_by=st.session_state.get("user_id"),
+        )
+        _clear_ruling_target()
+        st.session_state["ruling_flash"] = True
+        st.rerun()
 
 
 # =============================================================
@@ -318,3 +444,242 @@ def _render_usage_stats():
             st.session_state["admin_nav_pending"] = NAV_CONVERSATIONS
             st.session_state["conv_target_user_id"] = target_uid
             st.rerun()
+
+
+# =============================================================
+# タブ4: 修正事例（管理者による裁定）
+# =============================================================
+def _scope_label(r: dict) -> str:
+    if r.get("form_name"):
+        return f"{r['domain_key']} / {r['form_name']}"
+    if r.get("domain_key"):
+        return f"{r['domain_key']}（制度全体）"
+    return "全体共通"
+
+
+def _current_threshold(key: str = SETTING_KEY_THRESHOLD, default: float = EMBED_THRESHOLD) -> float:
+    try:
+        return float(get_setting(key, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
+def _domain_options() -> list[str]:
+    """適用範囲の選択肢。domains フォルダの制度名をそのまま使う。"""
+    import os
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "domains")
+    try:
+        return sorted(d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d)))
+    except OSError:
+        return []
+
+
+def _render_ruling_tuning():
+    """しきい値の調整と、実際のヒット状況の確認。
+    再デプロイなしで調整できるようにしている（数値は運用しながら詰める前提のため）。
+    """
+    with st.expander("🎚 表示のしきい値とヒット状況"):
+        st.caption(
+            "スコアがしきい値以上の事例だけが現場に表示されます。"
+            "下げると拾いやすくなりますが、関係のない質問にも出やすくなります。"
+        )
+
+        current = _current_threshold()
+        current_global = _current_threshold(SETTING_KEY_GLOBAL_THRESHOLD, GLOBAL_THRESHOLD)
+
+        new_value = st.slider(
+            "しきい値：制度を指定した事例",
+            min_value=0.50, max_value=0.98, value=current, step=0.01,
+            help="日本語は文体が似ているだけでスコアが上がるため、低くしすぎると誤爆します。",
+        )
+        st.caption(f"現在の設定値: {current}（既定値 {EMBED_THRESHOLD}）")
+
+        new_global = st.slider(
+            "しきい値：全体共通の事例",
+            min_value=0.50, max_value=0.99, value=current_global, step=0.01,
+            help="全体共通の事例はどの制度の質問にも表示されるため、より厳しくします。",
+        )
+        st.caption(
+            f"現在の設定値: {current_global}（既定値 {GLOBAL_THRESHOLD}）　"
+            "スコアは質問文だけで決まり制度は考慮しないため、"
+            "制度を指定しない事例は他の制度の質問にも届いてしまいます。"
+        )
+
+        if st.button("保存", type="primary"):
+            set_setting(SETTING_KEY_THRESHOLD, str(new_value))
+            set_setting(SETTING_KEY_GLOBAL_THRESHOLD, str(new_global))
+            st.success(f"しきい値を {new_value} / {new_global} に変更しました。")
+        st.caption("※ 反映まで最大1分かかります（アプリ側でキャッシュしているため）")
+
+        st.divider()
+        st.markdown("**直近のヒット状況**")
+        st.caption(
+            "しきい値を通らなかった候補も含めて記録しています。"
+            "「表示」が✅なのに関係のない質問なら、しきい値を上げてください。"
+        )
+
+        hits = get_recent_ruling_hits(limit=100)
+        if not hits:
+            st.info("まだ記録がありません。")
+            return
+
+        import pandas as pd
+        df = pd.DataFrame(hits)
+        df["表示"] = df["shown"].map({1: "✅", 0: ""})
+        df["スコア"] = df["score"].map(lambda v: f"{v:.3f}")
+        df = df.rename(columns={
+            "created_at":    "日時",
+            "question":      "現場の質問",
+            "question_text": "ヒットした事例",
+            "method":        "方式",
+        })
+        st.dataframe(
+            df[["日時", "現場の質問", "ヒットした事例", "スコア", "表示", "方式"]],
+            use_container_width=True, hide_index=True,
+        )
+
+
+def _render_rulings_manager():
+    st.markdown("### ⚖️ 修正事例")
+    st.caption(
+        "AIの回答が実務的に誤っていた場合に、管理者が正しい回答を登録したものです。"
+        "現場の画面では、似た質問が出たときに回答の下へ参考として表示されます。"
+        "登録は「💬 会話履歴閲覧」で対象の回答を開き、「✏️ この回答を修正」から行います。"
+    )
+
+    _render_ruling_tuning()
+
+    # 類似判定がどちらの方式で動いているかを本番環境で確認するための診断
+    with st.expander("🔧 類似判定の方式を確認"):
+        st.caption(
+            "「似た質問」の判定は埋め込みベクトルで行います。"
+            "APIキーがこのモデルに対応していない場合は、自動的にバイグラム一致に切り替わります"
+            "（言い換えを拾えなくなるため精度は落ちます）。"
+        )
+        if st.button("接続を確認する"):
+            vec = embed_text(get_client(), "対象労働者の要件を教えてください")
+            if vec:
+                st.success(f"埋め込みベクトル方式で動作しています（{len(vec)}次元）。")
+            else:
+                st.warning(
+                    "埋め込みモデルを利用できないため、バイグラム一致で動作しています。"
+                    "APIキーの対応状況を確認してください。"
+                )
+
+    rulings = get_rulings_for_admin()
+    if not rulings:
+        st.info("まだ修正事例が登録されていません。")
+        return
+
+    search = st.text_input(
+        "🔍 質問文・回答で検索",
+        key="ruling_search",
+        placeholder="キーワードの一部を入力（空欄で全件表示）",
+    )
+    if search:
+        s = search.lower()
+        rulings = [
+            r for r in rulings
+            if s in r["question_text"].lower() or s in r["corrected_answer"].lower()
+        ]
+    show_inactive = st.toggle("無効化した事例も表示", value=False, key="ruling_show_inactive")
+    if not show_inactive:
+        rulings = [r for r in rulings if r["is_active"] == 1]
+
+    if not rulings:
+        st.warning("該当する事例がありません。")
+        return
+
+    st.caption(f"{len(rulings)}件")
+
+    for r in rulings:
+        status = "" if r["is_active"] == 1 else "⛔ "
+        shown_count = r.get("shown_count") or 0
+        header = (
+            f"{status}[{_year_label(r['app_year'])}] {r['question_text'][:40]}"
+            f"　（表示{shown_count}回）"
+        )
+        with st.expander(header):
+            st.caption(
+                f"適用範囲: {_scope_label(r)}　登録: {r.get('created_by_name') or '不明'} / "
+                f"{r['created_at'][:10]}　更新: {r['updated_at'][:10]}"
+            )
+            if shown_count >= 20:
+                st.warning(
+                    "表示回数が多い事例です。関係のない質問にも出ていないか確認してください。"
+                )
+
+            with st.form(f"ruling_edit_{r['id']}"):
+                q = st.text_area("質問文", value=r["question_text"], height=80)
+                a = st.text_area("正しい回答", value=r["corrected_answer"], height=180)
+                memo = st.text_input("メモ（現場には表示されません）", value=r["comment"])
+
+                # 適用範囲は登録後に間違いに気づくことがあるので変更できるようにする
+                domains = _domain_options()
+                has_domain = bool((r["domain_key"] or "").strip())
+                scope_mode = st.radio(
+                    "適用範囲",
+                    ["制度を指定", "全体共通"],
+                    index=0 if has_domain else 1,
+                    horizontal=True,
+                    key=f"scope_mode_{r['id']}",
+                )
+                dom_index = domains.index(r["domain_key"]) if r["domain_key"] in domains else 0
+                new_domain = st.selectbox(
+                    "制度（「制度を指定」を選んだ場合）",
+                    options=domains or [""],
+                    index=dom_index,
+                    key=f"scope_dom_{r['id']}",
+                )
+                keep_form = False
+                if (r["form_name"] or "").strip():
+                    keep_form = st.checkbox(
+                        f"様式「{r['form_name']}」にも限定する",
+                        value=True, key=f"scope_form_{r['id']}",
+                    )
+                st.caption(
+                    "「全体共通」はあらゆる制度の質問に表示されます。"
+                    "そのぶん厳しいしきい値で判定されます。"
+                )
+                saved = st.form_submit_button("保存", type="primary")
+
+            if saved:
+                if not q.strip() or not a.strip():
+                    st.error("質問文と正しい回答は必須です。")
+                elif scope_mode == "制度を指定" and not new_domain:
+                    st.error("制度を選択してください。")
+                else:
+                    if scope_mode == "全体共通":
+                        dk, fn = "", ""
+                    else:
+                        dk = new_domain
+                        fn = r["form_name"] if keep_form else ""
+                    update_ruling(
+                        r["id"], q.strip(), a.strip(),
+                        domain_key=dk, form_name=fn,
+                        comment=memo.strip(),
+                        embedding=encode_embedding(embed_text(get_client(), q.strip())),
+                    )
+                    st.success("保存しました。")
+                    st.rerun()
+
+            # 元のAI回答は管理者だけが見る（現場には表示しない）
+            if r["original_answer"] and st.checkbox("元のAI回答を表示", key=f"orig_{r['id']}"):
+                st.text(r["original_answer"])
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if r["is_active"] == 1:
+                    if st.button("⛔ 無効化", key=f"deact_{r['id']}", use_container_width=True):
+                        set_ruling_active(r["id"], False)
+                        st.rerun()
+                else:
+                    if st.button("✅ 有効化", key=f"act_{r['id']}", use_container_width=True):
+                        set_ruling_active(r["id"], True)
+                        st.rerun()
+            with c2:
+                confirm = st.checkbox("削除を確認", key=f"delchk_{r['id']}")
+                if st.button("🗑 削除", key=f"del_{r['id']}",
+                             disabled=not confirm, use_container_width=True):
+                    delete_ruling(r["id"])
+                    st.rerun()

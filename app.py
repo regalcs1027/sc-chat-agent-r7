@@ -11,6 +11,13 @@ from db import (
     create_conversation, add_message, touch_conversation,
     update_conversation_title,
     get_conversations_by_user, get_messages_by_conversation, get_conversation,
+    get_active_rulings, record_ruling_hits, get_shown_ruling_ids_by_conversation,
+    get_setting,
+)
+from rulings import (
+    search_rulings, SHOW_LIMIT, SNIPPET_CHARS,
+    EMBED_THRESHOLD, SETTING_KEY_THRESHOLD,
+    GLOBAL_THRESHOLD, SETTING_KEY_GLOBAL_THRESHOLD,
 )
 from auth import login, logout, require_login, require_admin
 
@@ -59,12 +66,18 @@ if not api_key:
 
 client = Client(api_key=api_key)
 
-# DB テーブルをアプリ起動時に1回だけ初期化（st.cache_resource でキャッシュ）
+# DB テーブルの初期化。st.cache_resource はプロセスが生きている限り再実行されず、
+# Streamlit Cloud は再デプロイ時にプロセスを作り直さない（スクリプトを再実行するだけ）。
+# そのため、テーブルを追加・変更したら必ず SCHEMA_VERSION を上げること。
+# 上げないと Reboot するまで新しいテーブルが作られず UndefinedTable で落ちる。
+SCHEMA_VERSION = 2  # v2: admin_rulings / ruling_hits / app_settings を追加
+
+
 @st.cache_resource
-def _init_db():
+def _init_db(schema_version: int):
     create_tables()
 
-_init_db()
+_init_db(SCHEMA_VERSION)
 
 
 # =============================================================
@@ -170,6 +183,92 @@ def get_relevant_chunks(query: str, pdf_chunks: list, max_chunks: int = 3) -> st
     scored.sort(key=lambda x: x[0], reverse=True)
     results = [f"[出典: {src}]\n{cont}" for _, cont, src in scored[:max_chunks]]
     return "\n---\n".join(results)
+
+
+# =============================================================
+# 管理者による修正事例（裁定）の参考表示
+#   Phase 1: 表示のみ。システムプロンプトには渡さないため、AIの回答本文は汚染されない。
+# =============================================================
+@st.cache_data(ttl=60, show_spinner=False)
+def load_active_rulings(app_year: str) -> list[dict]:
+    """有効な修正事例。管理画面での追加を60秒以内に反映する"""
+    return get_active_rulings(app_year)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_thresholds() -> tuple[float, float]:
+    """管理画面で調整したしきい値。未設定ならコード側の既定値を使う。
+    戻り値: (制度を指定した事例用, 全体共通の事例用)
+    """
+    def _read(key: str, default: float) -> float:
+        try:
+            return float(get_setting(key, str(default)))
+        except (ValueError, TypeError):
+            return default
+
+    return (
+        _read(SETTING_KEY_THRESHOLD, EMBED_THRESHOLD),
+        _read(SETTING_KEY_GLOBAL_THRESHOLD, GLOBAL_THRESHOLD),
+    )
+
+
+def rulings_by_ids(ids: list[int]) -> list[dict]:
+    """表示済みの事例IDから本体を引く。無効化された事例は自然に消える。"""
+    if not ids:
+        return []
+    by_id = {r["id"]: r for r in load_active_rulings(APP_YEAR)}
+    return [by_id[i] for i in ids if i in by_id]
+
+
+def _render_one_ruling(r: dict, allow_expander: bool = True) -> None:
+    st.markdown(f"質問：{r['question_text']}")
+    answer = r["corrected_answer"]
+    # 長文は畳む。ただし折りたたみの中では入れ子にできないので全文を出す
+    if len(answer) > SNIPPET_CHARS and allow_expander:
+        st.markdown(f"回答：{answer[:SNIPPET_CHARS]}…")
+        with st.expander("続きを読む"):
+            st.markdown(answer)
+    else:
+        st.markdown(f"回答：{answer}")
+
+
+def render_rulings_block(rulings: list[dict]) -> None:
+    """該当なしのときは枠ごと出さない（「関連事例なし」も表示しない）"""
+    if not rulings:
+        return
+    st.divider()
+    st.markdown("**※管理者による修正事例**")
+    for r in rulings[:SHOW_LIMIT]:
+        _render_one_ruling(r)
+    rest = rulings[SHOW_LIMIT:]
+    if rest:
+        with st.expander(f"他に{len(rest)}件の関連事例があります"):
+            for r in rest:
+                _render_one_ruling(r, allow_expander=False)
+
+
+def attach_rulings(question: str, message_id: int | None) -> list[int]:
+    """修正事例を検索し、表示・記録して、表示した事例のIDを返す。
+    補助機能なので、ここで失敗しても回答表示は妨げない。
+    """
+    try:
+        active = load_active_rulings(APP_YEAR)
+        if not active:
+            return []
+        base_th, global_th = load_thresholds()
+        shown, candidates = search_rulings(
+            client, question, active,
+            st.session_state.get("selected_domain_key", ""),
+            st.session_state.get("selected_form", ""),
+            embed_threshold=base_th,
+            global_threshold=global_th,
+        )
+        if candidates:
+            record_ruling_hits(APP_YEAR, question, candidates, message_id)
+        render_rulings_block(shown)
+        return [r["id"] for r in shown]
+    except Exception:
+        return []
 
 
 # =============================================================
@@ -378,62 +477,74 @@ def build_gemini_contents(messages: list, current_prompt: str) -> list:
 # =============================================================
 MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
+WAITING_MESSAGE = "🤔 回答を作成しています"
+
+
 def send_and_stream(prompt: str) -> bool:
     """ユーザーの質問を処理してストリーミング応答を返す共通関数。成功時True"""
-    stage           = get_stage_for_form(st.session_state.selected_form, domain_config)
-    filtered_rules  = filter_rules_by_stage(rules_and_cases, stage)
-    relevant_chunks = get_relevant_chunks(prompt, pdf_chunks)
-    system_prompt = build_system_prompt(
-        st.session_state.selected_grant,
-        st.session_state.selected_form,
-        form_map, filtered_rules, relevant_chunks,
-    )
-    gemini_contents = build_gemini_contents(st.session_state.messages, prompt)
-
     with st.chat_message("assistant"):
         placeholder = st.empty()
         full = ""
-
-        # モデルを順に試行（2.5-flash → 2.0-flash フォールバック）
         last_error = None
-        for model_name in MODELS:
-            full = ""
-            try:
-                for chunk in client.models.generate_content_stream(
-                    model=model_name,
-                    contents=gemini_contents,
-                    config=types.GenerateContentConfig(system_instruction=system_prompt),
-                ):
-                    # Gemini 2.5 の思考チャンク（thought=True）をスキップ
-                    if not getattr(chunk, "candidates", None):
+
+        # 最初の1文字が出るまで数秒〜十数秒かかることがある。その間なにも出ていないと
+        # 「止まったのか考えているのか」が分からないため、生成中はスピナーを出す。
+        # スピナーはブラウザ側のアニメーションなので、サーバが応答待ちの間も動き続ける。
+        with st.spinner(f"{WAITING_MESSAGE}…"):
+            stage           = get_stage_for_form(st.session_state.selected_form, domain_config)
+            filtered_rules  = filter_rules_by_stage(rules_and_cases, stage)
+            relevant_chunks = get_relevant_chunks(prompt, pdf_chunks)
+            system_prompt = build_system_prompt(
+                st.session_state.selected_grant,
+                st.session_state.selected_form,
+                form_map, filtered_rules, relevant_chunks,
+            )
+            gemini_contents = build_gemini_contents(st.session_state.messages, prompt)
+
+            # モデルを順に試行（2.5-flash → 2.5-flash-lite フォールバック）
+            for model_name in MODELS:
+                full = ""
+                try:
+                    for chunk in client.models.generate_content_stream(
+                        model=model_name,
+                        contents=gemini_contents,
+                        config=types.GenerateContentConfig(system_instruction=system_prompt),
+                    ):
+                        # Gemini 2.5 の思考チャンク（thought=True）をスキップ
+                        if not getattr(chunk, "candidates", None):
+                            continue
+                        content = chunk.candidates[0].content
+                        if not content or not content.parts:
+                            continue
+                        for part in content.parts:
+                            if getattr(part, "thought", False):
+                                continue  # 思考プロセスはユーザーに表示しない
+                            if part.text:
+                                full += part.text
+                                placeholder.markdown(full + "▌")
+                    placeholder.markdown(full or "（回答を生成できませんでした）")
+                    if full:
+                        # DB に AI 応答を保存
+                        conv_id = st.session_state.get("current_conv_id")
+                        msg_id = None
+                        if conv_id:
+                            msg_id = add_message(conv_id, "assistant", full)
+                            touch_conversation(conv_id)
+                        # 管理者による修正事例を参考表示（AIの回答生成には関与しない）
+                        ruling_ids = attach_rulings(prompt, msg_id)
+                        st.session_state.messages.append({
+                            "role": "assistant", "content": full, "ruling_ids": ruling_ids,
+                        })
+                    return True
+                except Exception as e:
+                    last_error = e
+                    err_str = str(e)
+                    # レート制限エラーの場合は次のモデルで再試行
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        placeholder.markdown(f"⏳ {model_name} のレート制限に到達。別モデルで再試行中...")
                         continue
-                    content = chunk.candidates[0].content
-                    if not content or not content.parts:
-                        continue
-                    for part in content.parts:
-                        if getattr(part, "thought", False):
-                            continue  # 思考プロセスはユーザーに表示しない
-                        if part.text:
-                            full += part.text
-                            placeholder.markdown(full + "▌")
-                placeholder.markdown(full or "（回答を生成できませんでした）")
-                if full:
-                    st.session_state.messages.append({"role": "assistant", "content": full})
-                    # DB に AI 応答を保存
-                    conv_id = st.session_state.get("current_conv_id")
-                    if conv_id:
-                        add_message(conv_id, "assistant", full)
-                        touch_conversation(conv_id)
-                return True
-            except Exception as e:
-                last_error = e
-                err_str = str(e)
-                # レート制限エラーの場合は次のモデルで再試行
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    placeholder.markdown(f"⏳ {model_name} のレート制限に到達。別モデルで再試行中...")
-                    continue
-                # レート制限以外のエラーはそのまま表示
-                break
+                    # レート制限以外のエラーはそのまま表示
+                    break
 
         placeholder.empty()
         st.error(f"⚠️ エラーが発生しました: {last_error}")
@@ -630,7 +741,11 @@ elif st.session_state.app_state == "setup":
                 _caption = _conv["updated_at"][:10] if _conv.get("updated_at") else ""
                 if st.button(_label, key=f"setup_conv_{_conv['id']}", use_container_width=True, help=_caption):
                     _msgs = get_messages_by_conversation(_conv["id"])
-                    st.session_state.messages        = [{"role": m["role"], "content": m["content"]} for m in _msgs]
+                    _hits = get_shown_ruling_ids_by_conversation(_conv["id"])
+                    st.session_state.messages        = [
+                        {"role": m["role"], "content": m["content"], "ruling_ids": _hits.get(m["id"], [])}
+                        for m in _msgs
+                    ]
                     st.session_state.current_conv_id = _conv["id"]
                     st.session_state.selected_domain_key = _conv["domain_key"]
                     st.session_state.selected_form   = _conv["form_name"]
@@ -803,7 +918,11 @@ elif st.session_state.app_state == "chat":
                          help=_caption, disabled=_is_current):
                 # 過去スレッドを選択して復元
                 _msgs = get_messages_by_conversation(_conv["id"])
-                st.session_state.messages        = [{"role": m["role"], "content": m["content"]} for m in _msgs]
+                _hits = get_shown_ruling_ids_by_conversation(_conv["id"])
+                st.session_state.messages        = [
+                    {"role": m["role"], "content": m["content"], "ruling_ids": _hits.get(m["id"], [])}
+                    for m in _msgs
+                ]
                 st.session_state.current_conv_id = _conv["id"]
                 st.session_state.selected_domain_key = _conv["domain_key"]
                 st.session_state.selected_form   = _conv["form_name"]
@@ -889,6 +1008,8 @@ elif st.session_state.app_state == "chat":
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
+                if msg["role"] == "assistant" and msg.get("ruling_ids"):
+                    render_rulings_block(rulings_by_ids(msg["ruling_ids"]))
 
         # ── 項目ボタンからの自動送信処理 ──────────────────────
         if st.session_state.pending_item is not None:
