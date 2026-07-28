@@ -139,13 +139,19 @@ def _bigram_score(a: str, b: str) -> float:
 # =============================================================
 # 検索本体
 # =============================================================
+# 様式を選ばずに質問しているときの様式名。これが「様式」として保存されている事例は、
+# 様式で絞る意図ではないので制度全体として扱う（そうしないと、様式を選んでいない
+# 利用者にしか表示されない事例になってしまう）。
+GENERIC_FORM_NAME = "全般（様式を特定しない）"
+
+
 def _in_scope(ruling: dict, domain_key: str, form_name: str) -> bool:
     """スコープ判定。空欄は「全体共通」の意味なので常に対象"""
     rd = (ruling.get("domain_key") or "").strip()
     rf = (ruling.get("form_name") or "").strip()
     if rd and rd != domain_key:
         return False
-    if rf and rf != form_name:
+    if rf and rf != GENERIC_FORM_NAME and rf != form_name:
         return False
     return True
 

@@ -22,6 +22,12 @@ def _year_label(app_year: str) -> str:
     return {"R7": "令和7年度版", "R8": "令和8年度版"}.get(app_year or "R7", app_year or "R7")
 
 
+# 様式を選ばずに質問しているときの selected_form の値（app.py の form_options と対応）。
+# これを「様式」として修正事例に保存すると、様式を選んでいない利用者にしか
+# 表示されない事例になってしまうため、適用範囲の判定で特別扱いする。
+GENERIC_FORM_NAME = "全般（様式を特定しない）"
+
+
 # 管理画面のナビゲーション項目（st.radio で切替。プログラムからの遷移に対応）
 NAV_USERS = "👥 ユーザー管理"
 NAV_CONVERSATIONS = "💬 会話履歴閲覧"
@@ -318,11 +324,30 @@ def _render_ruling_form(target: dict) -> None:
         )
         q = st.text_area("質問文", value=target["question"], height=80)
         a = st.text_area("正しい回答（現場にはこの内容が表示されます）", height=180)
+        # 元の会話で様式を選んでいなかった場合、「様式のみ」で登録すると
+        # 「全般」を選んでいる利用者にしか表示されなくなる。選択肢自体を出さない。
+        form_name = (target["form_name"] or "").strip()
+        form_is_generic = form_name in ("", GENERIC_FORM_NAME)
+        scope_options = (
+            ["この制度全体", "全体共通"] if form_is_generic
+            else ["この制度・様式のみ", "この制度全体", "全体共通"]
+        )
         scope = st.radio(
             "適用範囲",
-            ["この制度・様式のみ", "この制度全体", "全体共通"],
+            scope_options,
+            index=scope_options.index("この制度全体"),  # 迷ったら制度全体が無難
             horizontal=True,
         )
+        if form_is_generic:
+            st.caption(
+                "※ 元の会話で様式を選んでいなかったため、「様式のみ」は選べません"
+                "（登録しても、様式を選んでいない利用者にしか表示されないため）。"
+            )
+        else:
+            st.caption(
+                f"「この制度・様式のみ」は、利用者が様式「{form_name}」を選んでいるときだけ"
+                "表示されます。記入欄など様式固有の話でなければ「この制度全体」を推奨します。"
+            )
         st.caption(
             f"⚠️「全体共通」を選ぶと、{target['domain_key']} 以外のすべての制度の質問にも"
             "表示される可能性があります。判定は厳しくなりますが、"
@@ -632,9 +657,10 @@ def _render_rulings_manager():
                     key=f"scope_dom_{r['id']}",
                 )
                 keep_form = False
-                if (r["form_name"] or "").strip():
+                cur_form = (r["form_name"] or "").strip()
+                if cur_form and cur_form != GENERIC_FORM_NAME:
                     keep_form = st.checkbox(
-                        f"様式「{r['form_name']}」にも限定する",
+                        f"様式「{cur_form}」にも限定する（この様式を選んでいるときだけ表示）",
                         value=True, key=f"scope_form_{r['id']}",
                     )
                 st.caption(
