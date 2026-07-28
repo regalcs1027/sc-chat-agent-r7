@@ -1,0 +1,10 @@
+{
+  "display_name": "特定求職者雇用開発助成金",
+  "applies_to_options": [
+    "計画届",
+    "支給申請",
+    "全般"
+  ],
+  "form_to_stage": {},
+  "form_order": []
+}
