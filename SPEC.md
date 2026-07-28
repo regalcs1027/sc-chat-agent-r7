@@ -25,7 +25,7 @@
 | AIモデル | Gemini 2.5 Flash（google-genai SDK） |
 | 言語 | Python |
 | デプロイ | Streamlit Cloud（GitHub連携・自動デプロイ） |
-| リポジトリ | GitHub: `Kota0810/sc-chat-agent-r7`（R7版） / `Kota0810/sc-chat-agent-r8`（R8版） |
+| リポジトリ | GitHub: `regalcs1027/sc-chat-agent-r7`（R7版） / `regalcs1027/sc-chat-agent-r8`（R8版） |
 
 ### ⚠️ 重要：Streamlitバージョン固定
 ```
