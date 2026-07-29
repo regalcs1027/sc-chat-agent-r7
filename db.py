@@ -147,6 +147,7 @@ def create_tables():
                 source_conversation_id INTEGER,
                 source_message_id      INTEGER,
                 embedding              TEXT,
+                notified_at            TEXT,
                 use_in_prompt          INTEGER NOT NULL DEFAULT 0,
                 is_active              INTEGER NOT NULL DEFAULT 1,
                 created_by             INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -177,6 +178,8 @@ def create_tables():
                 updated_at TEXT NOT NULL
             )
             """)
+            # 既存DBへの後方互換（テーブルが既にある場合は上の CREATE TABLE が効かないため）
+            cur.execute("ALTER TABLE admin_rulings ADD COLUMN IF NOT EXISTS notified_at TEXT")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_ruling_year ON admin_rulings(app_year, is_active)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_hit_ruling  ON ruling_hits(ruling_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_hit_msg     ON ruling_hits(message_id)")
@@ -467,6 +470,63 @@ def set_message_reviewed(answer_id: int, reviewer_id: int | None, reviewed: bool
                     "UPDATE messages SET reviewed = 0, reviewed_by = NULL, reviewed_at = NULL WHERE id = %s",
                     (answer_id,),
                 )
+
+
+# =============================================================
+# メール通知用（GitHub Actions から毎時呼ばれる）
+#   notified_at に印を付けることで、同じ質問・同じ修正を二度通知しない。
+# =============================================================
+def get_unnotified_questions(app_year: str, older_than_minutes: int = 60) -> list[dict]:
+    """未確認かつ未通知で、投稿から一定時間が経過した質問を返す。"""
+    cutoff = (datetime.now(JST) - timedelta(minutes=older_than_minutes)).strftime("%Y-%m-%d %H:%M:%S")
+    sql = (
+        _qa_base_query()
+        + " AND p.reviewed = 0 AND c.app_year = %s AND p.created_at <= %s"
+        + " AND NOT EXISTS (SELECT 1 FROM messages mm WHERE mm.id = p.answer_id AND mm.notified_at IS NOT NULL)"
+        + " ORDER BY p.created_at ASC"
+    )
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (app_year, cutoff))
+            rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_questions_notified(answer_ids: list[int]) -> None:
+    if not answer_ids:
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE messages SET notified_at = %s WHERE id = ANY(%s)",
+                (_now(), list(answer_ids)),
+            )
+
+
+def get_unnotified_rulings() -> list[dict]:
+    """まだ通知していない修正事例を返す（修正1件につき1通送る）。"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT r.*, u.display_name AS created_by_name
+                FROM admin_rulings r
+                LEFT JOIN users u ON u.id = r.created_by
+                WHERE r.notified_at IS NULL
+                ORDER BY r.id ASC
+            """)
+            rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_rulings_notified(ruling_ids: list[int]) -> None:
+    if not ruling_ids:
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE admin_rulings SET notified_at = %s WHERE id = ANY(%s)",
+                (_now(), list(ruling_ids)),
+            )
 
 
 def count_unreviewed(app_year: str | None = None) -> int:

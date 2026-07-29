@@ -70,7 +70,7 @@ client = Client(api_key=api_key)
 # Streamlit Cloud は再デプロイ時にプロセスを作り直さない（スクリプトを再実行するだけ）。
 # そのため、テーブルを追加・変更したら必ず SCHEMA_VERSION を上げること。
 # 上げないと Reboot するまで新しいテーブルが作られず UndefinedTable で落ちる。
-SCHEMA_VERSION = 3  # v3: messages に reviewed / reviewed_by / reviewed_at / notified_at を追加
+SCHEMA_VERSION = 4  # v4: admin_rulings に notified_at を追加（メール通知の二重送信防止）
 
 
 @st.cache_resource
