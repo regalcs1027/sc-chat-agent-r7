@@ -115,10 +115,21 @@ def create_tables():
                 ALTER TABLE conversations
                 ADD COLUMN IF NOT EXISTS app_year TEXT NOT NULL DEFAULT 'R7'
             """)
+            # 管理者による確認状態（AI回答のメッセージに付く）。
+            # notified_at は未確認通知メールを送った時刻。同じ質問を何度も通知しないための印。
+            for col, ddl in (
+                ("reviewed",    "INTEGER NOT NULL DEFAULT 0"),
+                ("reviewed_by", "INTEGER"),
+                ("reviewed_at", "TEXT"),
+                ("notified_at", "TEXT"),
+            ):
+                cur.execute(f"ALTER TABLE messages ADD COLUMN IF NOT EXISTS {col} {ddl}")
+
             cur.execute("CREATE INDEX IF NOT EXISTS idx_conv_user     ON conversations(user_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_conv_updated  ON conversations(updated_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_conv_app_year ON conversations(app_year)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_conv      ON messages(conversation_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_reviewed  ON messages(reviewed)")
 
             # ── 管理者による修正事例（裁定）─────────────────────
             # source_conversation_id / source_message_id はあえて外部キーにしない。
@@ -371,6 +382,103 @@ def get_messages_by_conversation(conv_id: int) -> list[dict]:
             )
             rows = cur.fetchall()
     return [dict(r) for r in rows]
+
+
+# =============================================================
+# 質問一覧（全ユーザー横断）
+#   会話履歴閲覧は「ユーザーを選ぶ→会話を選ぶ」の2段階で人ごとにしか見られないため、
+#   質問と回答を1行にした横断一覧を別途用意する。
+# =============================================================
+def _qa_base_query() -> str:
+    """AI回答と、その直前のユーザー発言（＝質問）を1行に組み立てる。
+    LAG で1つ前のメッセージを引き、それが user のものだけを採用する。
+    """
+    return """
+        WITH paired AS (
+            SELECT
+                m.id              AS answer_id,
+                m.conversation_id,
+                m.role,
+                m.content         AS answer,
+                m.created_at,
+                m.reviewed, m.reviewed_by, m.reviewed_at,
+                LAG(m.content) OVER (PARTITION BY m.conversation_id ORDER BY m.id) AS question,
+                LAG(m.role)    OVER (PARTITION BY m.conversation_id ORDER BY m.id) AS prev_role
+            FROM messages m
+        )
+        SELECT
+            p.answer_id, p.conversation_id, p.question, p.answer, p.created_at,
+            p.reviewed, p.reviewed_at,
+            c.app_year, c.domain_key, c.form_name,
+            u.id AS user_id, u.display_name, u.username,
+            ru.display_name AS reviewer_name
+        FROM paired p
+        JOIN conversations c ON c.id = p.conversation_id
+        JOIN users u         ON u.id = c.user_id
+        LEFT JOIN users ru   ON ru.id = p.reviewed_by
+        WHERE p.role = 'assistant' AND p.prev_role = 'user'
+    """
+
+
+def get_qa_list(
+    app_year: str | None = None,
+    unreviewed_only: bool = False,
+    user_id: int | None = None,
+    keyword: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    limit: int = 1000,
+) -> list[dict]:
+    sql = _qa_base_query()
+    params: list = []
+    if app_year:
+        sql += " AND c.app_year = %s"; params.append(app_year)
+    if unreviewed_only:
+        sql += " AND p.reviewed = 0"
+    if user_id:
+        sql += " AND u.id = %s"; params.append(user_id)
+    if keyword:
+        sql += " AND (p.question ILIKE %s OR p.answer ILIKE %s)"
+        params += [f"%{keyword}%", f"%{keyword}%"]
+    if date_from:
+        sql += " AND p.created_at >= %s"; params.append(date_from)
+    if date_to:
+        # 終了日は当日を含めたいので 23:59:59 まで
+        sql += " AND p.created_at <= %s"; params.append(f"{date_to} 23:59:59")
+    sql += " ORDER BY p.created_at DESC LIMIT %s"; params.append(limit)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_message_reviewed(answer_id: int, reviewer_id: int | None, reviewed: bool = True) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if reviewed:
+                cur.execute(
+                    "UPDATE messages SET reviewed = 1, reviewed_by = %s, reviewed_at = %s WHERE id = %s",
+                    (reviewer_id, _now(), answer_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE messages SET reviewed = 0, reviewed_by = NULL, reviewed_at = NULL WHERE id = %s",
+                    (answer_id,),
+                )
+
+
+def count_unreviewed(app_year: str | None = None) -> int:
+    sql = "SELECT COUNT(*) AS n FROM (" + _qa_base_query() + " AND p.reviewed = 0"
+    params: list = []
+    if app_year:
+        sql += " AND c.app_year = %s"; params.append(app_year)
+    sql += ") t"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            return cur.fetchone()["n"]
 
 
 # =============================================================

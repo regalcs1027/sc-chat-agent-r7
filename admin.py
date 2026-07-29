@@ -10,6 +10,7 @@ from db import (
     create_ruling, get_rulings_for_admin, get_active_rulings, update_ruling,
     set_ruling_active, delete_ruling, get_recent_ruling_hits,
     get_setting, set_setting,
+    get_qa_list, set_message_reviewed, count_unreviewed,
 )
 from rulings import (
     encode_embedding, embed_text, find_similar_for_admin, get_client,
@@ -30,10 +31,11 @@ GENERIC_FORM_NAME = "全般（様式を特定しない）"
 
 # 管理画面のナビゲーション項目（st.radio で切替。プログラムからの遷移に対応）
 NAV_USERS = "👥 ユーザー管理"
+NAV_QA = "📋 質問一覧"
 NAV_CONVERSATIONS = "💬 会話履歴閲覧"
 NAV_STATS = "📊 利用統計"
 NAV_RULINGS = "⚖️ 修正事例"
-NAV_OPTIONS = [NAV_USERS, NAV_CONVERSATIONS, NAV_STATS, NAV_RULINGS]
+NAV_OPTIONS = [NAV_QA, NAV_USERS, NAV_CONVERSATIONS, NAV_STATS, NAV_RULINGS]
 
 
 def render_admin_page():
@@ -65,7 +67,9 @@ def render_admin_page():
         label_visibility="collapsed",
     )
 
-    if nav == NAV_USERS:
+    if nav == NAV_QA:
+        _render_qa_list()
+    elif nav == NAV_USERS:
         _render_user_management()
     elif nav == NAV_CONVERSATIONS:
         _render_conversation_viewer()
@@ -73,6 +77,136 @@ def render_admin_page():
         _render_rulings_manager()
     else:
         _render_usage_stats()
+
+
+# =============================================================
+# タブ0: 質問一覧（全ユーザー横断）
+# =============================================================
+def _qa_csv(rows: list[dict]) -> bytes:
+    """Excelでそのまま開けるようBOM付きUTF-8で出力する（BOMが無いと日本語が化ける）"""
+    import csv, io
+    buf = io.StringIO()
+    w = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+    w.writerow(["質問日時", "質問者", "ログインID", "年度", "制度", "様式",
+                "質問内容", "回答内容", "確認状態", "確認者", "確認日時"])
+    for r in rows:
+        w.writerow([
+            r["created_at"], r["display_name"], r["username"],
+            _year_label(r.get("app_year")), r.get("domain_key", ""), r.get("form_name", ""),
+            r.get("question", ""), r.get("answer", ""),
+            "確認済み" if r["reviewed"] else "未確認",
+            r.get("reviewer_name") or "", r.get("reviewed_at") or "",
+        ])
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def _render_qa_list():
+    st.markdown("### 📋 質問一覧")
+    st.caption(
+        "全ユーザーの質問と回答を新しい順に一覧表示します。"
+        "内容を確認したら「確認済みにする」を押してください。"
+    )
+
+    unreviewed = count_unreviewed()
+    if unreviewed:
+        st.warning(f"未確認の質問が {unreviewed} 件あります。")
+    else:
+        st.success("未確認の質問はありません。")
+
+    # ── 絞り込み ──
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        only_un = st.toggle("未確認のみ", value=bool(unreviewed), key="qa_only_unreviewed")
+    with c2:
+        year = st.selectbox("年度", ["すべて", "R7", "R8"], key="qa_year")
+    with c3:
+        kw = st.text_input("🔍 質問・回答を検索", key="qa_kw", placeholder="キーワードの一部")
+
+    c4, c5 = st.columns(2)
+    with c4:
+        d_from = st.text_input("開始日（YYYY-MM-DD・空欄可）", key="qa_from", placeholder="2026-07-01")
+    with c5:
+        d_to = st.text_input("終了日（YYYY-MM-DD・空欄可）", key="qa_to", placeholder="2026-07-31")
+
+    rows = get_qa_list(
+        app_year=None if year == "すべて" else year,
+        unreviewed_only=only_un,
+        keyword=kw.strip(),
+        date_from=d_from.strip(),
+        date_to=d_to.strip(),
+    )
+    if not rows:
+        st.info("該当する質問がありません。条件を変えてください。")
+        return
+
+    st.caption(f"{len(rows)}件（最大1000件まで表示）")
+    st.download_button(
+        "📥 CSVダウンロード（この絞り込み結果）",
+        data=_qa_csv(rows),
+        file_name="質問一覧.csv",
+        mime="text/csv",
+    )
+
+    import pandas as pd
+    df = pd.DataFrame([{
+        "日時": r["created_at"][:16],
+        "質問者": r["display_name"],
+        "年度": _year_label(r.get("app_year")),
+        "質問": _truncate(r.get("question", ""), 40),
+        "確認": "✅" if r["reviewed"] else "未確認",
+    } for r in rows])
+
+    st.caption("💡 行を選択すると全文が表示され、確認済みにできます。")
+    event = st.dataframe(
+        df, use_container_width=True, hide_index=True,
+        on_select="rerun", selection_mode="single-row",
+    )
+    sel = getattr(event, "selection", None)
+    picked = list(sel.rows) if sel and getattr(sel, "rows", None) else []
+    if not picked:
+        return
+
+    r = rows[picked[0]]
+    st.divider()
+    st.markdown(f"**{r['display_name']}（{r['username']}）**　{r['created_at']}")
+    st.caption(
+        f"{_year_label(r.get('app_year'))}　制度: {r.get('domain_key') or '—'}　"
+        f"様式: {r.get('form_name') or '—'}"
+    )
+    with st.chat_message("user"):
+        st.markdown(r.get("question", ""))
+    with st.chat_message("assistant"):
+        st.markdown(r.get("answer", ""))
+
+    if r["reviewed"]:
+        st.success(f"✅ 確認済み（{r.get('reviewer_name') or '不明'} / {r.get('reviewed_at') or ''}）")
+        if st.button("確認済みを取り消す", key=f"unrev_{r['answer_id']}"):
+            set_message_reviewed(r["answer_id"], None, False)
+            st.rerun()
+    else:
+        if st.button("✅ 確認済みにする", type="primary", key=f"rev_{r['answer_id']}"):
+            set_message_reviewed(r["answer_id"], st.session_state.get("user_id"), True)
+            st.rerun()
+
+    if st.button("✏️ この回答を修正", key=f"qafix_{r['answer_id']}"):
+        st.session_state["ruling_target"] = {
+            "message_id": r["answer_id"],
+            "conversation_id": r["conversation_id"],
+            "app_year": r.get("app_year") or "R7",
+            "domain_key": r.get("domain_key", ""),
+            "form_name": r.get("form_name", ""),
+            "question": r.get("question", ""),
+            "original_answer": r.get("answer", ""),
+        }
+        st.session_state.pop("ruling_similar", None)
+        st.session_state["admin_nav_pending"] = NAV_CONVERSATIONS
+        st.session_state["conv_target_user_id"] = r["user_id"]
+        st.rerun()
+
+
+def _truncate(s: str, n: int) -> str:
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[:n] + "…"
 
 
 # =============================================================
