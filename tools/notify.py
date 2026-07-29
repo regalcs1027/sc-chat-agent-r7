@@ -24,6 +24,7 @@ from email.message import EmailMessage
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db import (  # noqa: E402
+    create_tables,
     get_unnotified_questions, mark_questions_notified,
     get_unnotified_rulings, mark_rulings_notified,
 )
@@ -121,6 +122,11 @@ def main() -> int:
     if missing:
         print(f"エラー: 環境変数が設定されていません: {missing}")
         return 1
+
+    # 通知に使う列は Streamlit アプリの起動時にしか作られない。
+    # アプリが Reboot されていないと列が無くて落ちるため、ここでも用意しておく。
+    # すべて IF NOT EXISTS なので、何度実行しても既存データには影響しない。
+    create_tables()
 
     to_q = os.environ.get("MAIL_TO_QUESTION", "")
     to_r = os.environ.get("MAIL_TO_REVISION", "")
